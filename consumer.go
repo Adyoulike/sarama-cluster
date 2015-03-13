@@ -9,18 +9,24 @@ import (
 	"gopkg.in/tomb.v2"
 )
 
-// Consumer configuration options
-type ConsumerConfig struct {
-	// Standard consumer configuration
-	*sarama.ConsumerConfig
+// Config contains the consumer configuration options
+type Config struct {
+	// Config contains the standard consumer configuration
+	*sarama.Config
 
-	// Set to true if you want to automatically ack
-	// every event once it has been consumed through
-	// the Consumer.Events() channel
+	// IDPrefix allows to force custom prefixes for consumer IDs.
+	// By default IDs have the form of PREFIX:HOSTNAME:UUID.
+	// Defaults to the consumer group name.
+	IDPrefix string
+
+	// AutoAck will force the consumer to automatically ack
+	// every message once it has been consumed through
+	// the Consumer.Messages() channel if set to true
 	AutoAck bool
 
-	// Enable automatic commits but setting this options.
+	// CommitEvery enables automatic commits in periodic cycles.
 	// Automatic commits will remain disabled if is set to < 10ms
+	// Default: 0
 	CommitEvery time.Duration
 
 	// Notifier instance to handle info/error
@@ -28,8 +34,15 @@ type ConsumerConfig struct {
 	// Default: *LogNotifier
 	Notifier Notifier
 
-	// Session timeout for the underlying zookeeper client
-	// Default: time.Second*1
+	// DefaultOffsetMode tells the consumer where to resume, if no offset
+	// is stored or the stored offset is out-of-range.
+	// Permitted values are sarama.OffsetNewest and sarama.OffsetOldest.
+	// Default: sarama.OffsetOldest
+	DefaultOffsetMode int64
+
+	// ZKSessionTimeout sets the timeout for the underlying zookeeper client
+	// session.
+	// Default: 1s
 	ZKSessionTimeout time.Duration
 
 	// Chroot path of the kafka cluster inside zookeeper
@@ -39,15 +52,18 @@ type ConsumerConfig struct {
 	customID string
 }
 
-func (c *ConsumerConfig) normalize() {
-	if c.ConsumerConfig == nil {
-		c.ConsumerConfig = sarama.NewConsumerConfig()
+func (c *Config) normalize() {
+	if c.Config == nil {
+		c.Config = sarama.NewConfig()
 	}
 	if c.Notifier == nil {
 		c.Notifier = &LogNotifier{Logger}
 	}
 	if c.CommitEvery < 10*time.Millisecond {
 		c.CommitEvery = 0
+	}
+	if c.DefaultOffsetMode != sarama.OffsetOldest && c.DefaultOffsetMode != sarama.OffsetOldest {
+		c.DefaultOffsetMode = sarama.OffsetOldest
 	}
 	if c.ZKSessionTimeout == 0 {
 		c.ZKSessionTimeout = time.Second
@@ -57,25 +73,51 @@ func (c *ConsumerConfig) normalize() {
 type Consumer struct {
 	id, group, topic string
 
-	client *sarama.Client
-	config *ConsumerConfig
-	zoo    *ZK
-	events chan *sarama.ConsumerEvent
+	client   *sarama.Client
+	consumer *sarama.Consumer
+	config   *Config
+	zoo      *ZK
+	messages chan *sarama.ConsumerMessage
+	errors   chan *sarama.ConsumerError
 
+	read    map[int32]int64
+	rLock   sync.Mutex
 	acked   map[int32]int64
 	aLock   sync.Mutex
 	partIDs []int32
 	pLock   sync.Mutex
 
-	notifier Notifier
-	closer   tomb.Tomb
+	notifier  Notifier
+	closer    tomb.Tomb
+	ownClient bool
 }
 
-// NewConsumer creates a new consumer for a given topic.
+// NewConsumer creates a new consumer instance.
 // You MUST call Close() to avoid leaks.
-func NewConsumer(client *sarama.Client, zookeepers []string, group, topic string, config *ConsumerConfig) (*Consumer, error) {
+func NewConsumer(addrs, zookeepers []string, group, topic string, config *Config) (*Consumer, error) {
 	if config == nil {
-		config = new(ConsumerConfig)
+		config = new(Config)
+	}
+
+	client, err := sarama.NewClient(addrs, config.Config)
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := NewConsumerFromClient(client, zookeepers, group, topic, config)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+	c.ownClient = true
+	return c, nil
+}
+
+// NewConsumerFromClient creates a new consumer for a given topic, reuing an existing client
+// You MUST call Close() to avoid leaks.
+func NewConsumerFromClient(client *sarama.Client, zookeepers []string, group, topic string, config *Config) (*Consumer, error) {
+	if config == nil {
+		config = new(Config)
 	}
 	config.normalize()
 
@@ -88,16 +130,27 @@ func NewConsumer(client *sarama.Client, zookeepers []string, group, topic string
 		return nil, sarama.ConfigurationError("Empty group")
 	}
 
-	// Connect to zookeeper
-	zoo, err := NewZK(zookeepers, config.ZKChrootPath, config.ZKSessionTimeout)
+	// Generate unique consumer ID
+	id := config.customID
+	if id == "" {
+		prefix := config.IDPrefix
+		if prefix == "" {
+			prefix = group
+		}
+		id = newGUID(prefix)
+	}
 
+	// Create sarama consumer instance
+	scsmr, err := sarama.NewConsumerFromClient(client)
 	if err != nil {
 		return nil, err
 	}
 
-	id := config.customID
-	if id == "" {
-		id = newGUID(group)
+	// Connect to zookeeper
+	zoo, err := NewZK(zookeepers, config.ZKChrootPath, config.ZKSessionTimeout)
+	if err != nil {
+		scsmr.Close()
+		return nil, err
 	}
 
 	// Initialize consumer
@@ -106,37 +159,45 @@ func NewConsumer(client *sarama.Client, zookeepers []string, group, topic string
 		group: group,
 		topic: topic,
 
-		zoo:    zoo,
-		config: config,
-		client: client,
+		zoo:      zoo,
+		config:   config,
+		client:   client,
+		consumer: scsmr,
 
+		read:    make(map[int32]int64),
 		acked:   make(map[int32]int64),
 		partIDs: make([]int32, 0),
 
-		events: make(chan *sarama.ConsumerEvent),
+		messages: make(chan *sarama.ConsumerMessage),
+		errors:   make(chan *sarama.ConsumerError),
 	}
 
 	// Register consumer group and consumer itself
 	if err := consumer.register(); err != nil {
-		consumer.Close()
+		consumer.closeAll()
 		return nil, err
 	}
 
 	consumer.closer.Go(consumer.signalLoop)
-	if config.CommitEvery != 0 {
+	if config.CommitEvery > 0 {
 		consumer.closer.Go(consumer.commitLoop)
 	}
 	return consumer, nil
 }
 
-// Events exposes the event channel
-func (c *Consumer) Events() <-chan *sarama.ConsumerEvent { return c.events }
+// Messages returns the read channel for the messages that are returned by the broker
+func (c *Consumer) Messages() <-chan *sarama.ConsumerMessage { return c.messages }
+
+// Errors returns the read channel for any errors that occurred while consuming the partition.
+// You have to read this channel to prevent the consumer from deadlock.
+func (c *Consumer) Errors() <-chan *sarama.ConsumerError { return c.errors }
 
 // Claims exposes the partIDs partition ID
 func (c *Consumer) Claims() []int32 {
 	c.pLock.Lock()
-	defer c.pLock.Unlock()
-	return c.partIDs
+	ids := c.partIDs
+	c.pLock.Unlock()
+	return ids
 }
 
 // ID exposes the consumer ID
@@ -153,19 +214,14 @@ func (c *Consumer) Offset(partitionID int32) (int64, error) {
 	return c.zoo.Offset(c.group, c.topic, partitionID)
 }
 
-// Ack marks a consumer event as processed and stores the offset
+// Ack marks a consumer message as processed and stores the offset
 // for the next Commit() call.
-func (c *Consumer) Ack(event *sarama.ConsumerEvent) {
-	if event.Err != nil {
-		return
-	}
-
+func (c *Consumer) Ack(msg *sarama.ConsumerMessage) {
 	c.aLock.Lock()
-	defer c.aLock.Unlock()
-
-	if event.Offset > c.acked[event.Partition] {
-		c.acked[event.Partition] = event.Offset
+	if msg.Offset > c.acked[msg.Partition] {
+		c.acked[msg.Partition] = msg.Offset
 	}
+	c.aLock.Unlock()
 }
 
 // Commit persists ack'd offsets
@@ -176,6 +232,7 @@ func (c *Consumer) Commit() error {
 	}
 
 	for partitionID, offset := range snap {
+		// fmt.Printf("$,%s,%d,%d\n", c.id, partitionID, offset+1)
 		if err := c.zoo.Commit(c.group, c.topic, partitionID, offset+1); err != nil {
 			return err
 		}
@@ -205,35 +262,36 @@ func (c *Consumer) signalLoop() error {
 		}
 
 		// Start a rebalance cycle
-		acquired, watch, err := c.rebalance(claims)
+		watch, err := c.rebalance(claims)
 		if err != nil {
 			c.config.Notifier.RebalanceError(c, err)
+			c.reset(claims)
 			continue
 		}
 
-		// Remember current claims
-		claims = acquired
-
 		// Start a goroutine for each partition
 		done := make(chan struct{})
+		errs := make(chan struct{}, len(claims))
 		wait := new(sync.WaitGroup)
 		for _, pcsm := range claims {
 			wait.Add(1)
-			go c.consumeLoop(done, wait, pcsm)
+			go c.consumeLoop(done, errs, wait, pcsm)
 		}
 
 		// Wait for signals
 		select {
-		case <-c.closer.Dying():
+		case <-c.closer.Dying(): // on Close()
 			close(done)
 			wait.Wait()
 			return c.shutdown(claims)
-		case <-watch:
+		case <-watch: // on rebalance signal
+			close(done)
+			wait.Wait()
+		case <-errs: // on consume errors
 			close(done)
 			wait.Wait()
 		}
 	}
-	return nil
 }
 
 // Commit loop, triggers periodic commits configured in CommitEvery
@@ -244,29 +302,54 @@ func (c *Consumer) commitLoop() error {
 			return nil
 		case <-time.After(c.config.CommitEvery):
 		}
+
 		if err := c.Commit(); err != nil {
 			c.config.Notifier.CommitError(c, err)
 		}
 	}
-	return nil
 }
 
-// Event consumer loop for a single partition consumer
-func (c *Consumer) consumeLoop(done chan struct{}, wait *sync.WaitGroup, pcsm *sarama.Consumer) {
+// Message consumer loop for a single partition consumer
+func (c *Consumer) consumeLoop(done, errs chan struct{}, wait *sync.WaitGroup, pcsm *sarama.PartitionConsumer) {
 	defer wait.Done()
 
 	for {
 		select {
-		case event := <-pcsm.Events():
+		case msg := <-pcsm.Messages():
+			// fmt.Printf("*,%s,%d,%d\n", c.id, msg.Partition, msg.Offset)
 			select {
-			case c.events <- event:
+			case c.messages <- msg:
+				// fmt.Printf("+,%s,%d,%d\n", c.id, msg.Partition, msg.Offset)
+				c.rLock.Lock()
+				c.read[msg.Partition] = msg.Offset + 1
+				c.rLock.Unlock()
 				if c.config.AutoAck {
-					c.Ack(event)
+					c.Ack(msg)
 				}
 			case <-done:
+				// fmt.Printf("@,%s\n", c.id)
+				return
+			}
+		case msg := <-pcsm.Errors():
+			if msg.Err == sarama.ErrOffsetOutOfRange {
+				offset, err := c.client.GetOffset(c.topic, msg.Partition, sarama.EarliestOffset)
+				if err == nil {
+					c.rLock.Lock()
+					c.read[msg.Partition] = offset
+					c.rLock.Unlock()
+				}
+				errs <- struct{}{}
+			}
+
+			select {
+			case c.errors <- msg:
+				// fmt.Printf("!,%s,%d,%s\n", c.id, msg.Partition, msg.Error())
+			case <-done:
+				// fmt.Printf("@,%s\n", c.id)
 				return
 			}
 		case <-done:
+			// fmt.Printf("@,%s\n", c.id)
 			return
 		}
 	}
@@ -277,53 +360,59 @@ func (c *Consumer) consumeLoop(done chan struct{}, wait *sync.WaitGroup, pcsm *s
 // Shutdown the consumer, triggered by the main loop
 func (c *Consumer) shutdown(claims Claims) error {
 	err := c.reset(claims)
-	close(c.events)
-	c.zoo.Close()
+	c.closeAll()
 	return err
 }
 
+// Close all connections and channels
+func (c *Consumer) closeAll() {
+	close(c.messages)
+	close(c.errors)
+	c.zoo.Close()
+	c.consumer.Close()
+	if c.ownClient {
+		c.client.Close()
+	}
+}
+
 // Rebalance cycle, triggered by the main loop
-func (c *Consumer) rebalance(claims Claims) (Claims, <-chan zk.Event, error) {
+func (c *Consumer) rebalance(claims Claims) (<-chan zk.Event, error) {
 	c.config.Notifier.RebalanceStart(c)
+
+	// Commit and release existing claims
+	if err := c.reset(claims); err != nil {
+		return nil, err
+	}
 
 	// Fetch consumer list
 	consumerIDs, watch, err := c.zoo.Consumers(c.group)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Fetch partitions list
 	partitions, err := c.partitions()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Determine partitions and claim if changed
-	if partitions = partitions.Select(c.id, consumerIDs); !partitions.ConsistOf(claims) {
+	partitions = partitions.Select(c.id, consumerIDs)
 
-		// Commit and release existing claims
-		if err := c.reset(claims); err != nil {
-			return nil, nil, err
+	// Make new claims
+	for _, part := range partitions {
+		pcsm, err := c.claim(part.ID)
+		if err != nil {
+			return nil, err
 		}
-
-		// Make new claims
-		claims = make(Claims, len(partitions))
-		for _, part := range partitions {
-			pcsm, err := c.claim(part.ID)
-			if err != nil {
-				c.reset(claims)
-				return nil, nil, err
-			}
-			claims[part.ID] = pcsm
-		}
-
-		c.pLock.Lock()
-		c.partIDs = claims.PartitionIDs()
-		c.pLock.Unlock()
+		claims[part.ID] = pcsm
 	}
 
+	c.pLock.Lock()
+	c.partIDs = claims.PartitionIDs()
+	c.pLock.Unlock()
 	c.config.Notifier.RebalanceOK(c)
-	return claims, watch, nil
+	return watch, nil
 }
 
 // Commits offset and releases all claims
@@ -331,16 +420,28 @@ func (c *Consumer) reset(claims Claims) (err error) {
 	// Commit BEFORE releasing locks on partitions
 	err = c.Commit()
 
-	// Release claimed partitions, one by one, ignore errors
-	for partitionID, pcsm := range claims {
-		pcsm.Close()
-		c.zoo.Release(c.group, c.topic, partitionID, c.id)
+	// Close all existing consumers (async)
+	wait := sync.WaitGroup{}
+	for _, pcsm := range claims {
+		wait.Add(1)
+		go func(c *sarama.PartitionConsumer) {
+			defer wait.Done()
+			c.Close()
+		}(pcsm)
 	}
+	wait.Wait()
+
+	// Release claimed partitions, ignore errors
+	for partitionID := range claims {
+		c.zoo.Release(c.group, c.topic, partitionID, c.id)
+		delete(claims, partitionID)
+	}
+
 	return
 }
 
 // Claims a partition
-func (c *Consumer) claim(partitionID int32) (*sarama.Consumer, error) {
+func (c *Consumer) claim(partitionID int32) (*sarama.PartitionConsumer, error) {
 	err := c.zoo.Claim(c.group, c.topic, partitionID, c.id)
 	if err != nil {
 		return nil, err
@@ -349,9 +450,19 @@ func (c *Consumer) claim(partitionID int32) (*sarama.Consumer, error) {
 	offset, err := c.Offset(partitionID)
 	if err != nil {
 		return nil, err
+	} else if offset < 1 {
+		offset = c.config.DefaultOffsetMode
 	}
 
-	return sarama.NewConsumer(c.client, c.topic, partitionID, c.group, c.pcsmConfig(offset))
+	c.rLock.Lock()
+	last := c.read[partitionID]
+	c.rLock.Unlock()
+	if offset < last {
+		offset = last
+	}
+
+	// fmt.Printf(">,%s,%d,%d\n", c.id, partitionID, offset)
+	return c.consumer.ConsumePartition(c.topic, partitionID, offset)
 }
 
 // Registers consumer with zookeeper
@@ -383,25 +494,15 @@ func (c *Consumer) partitions() (PartitionSlice, error) {
 	return slice, nil
 }
 
-// Creates a consumer config for the offset
-func (c *Consumer) pcsmConfig(offset int64) *sarama.ConsumerConfig {
-	config := *c.config.ConsumerConfig
-	config.OffsetMethod = sarama.OffsetMethodOldest
-	if offset > 0 {
-		config.OffsetMethod = sarama.OffsetMethodManual
-		config.OffsetValue = offset
-	}
-	return &config
-}
-
 // Creates a snapshot of acked and reset the current value
 func (c *Consumer) resetAcked() map[int32]int64 {
 	c.aLock.Lock()
 	defer c.aLock.Unlock()
+
 	snap := make(map[int32]int64, len(c.acked))
 	for num, offset := range c.acked {
 		snap[num] = offset
+		delete(c.acked, num)
 	}
-	c.acked = make(map[int32]int64)
 	return snap
 }

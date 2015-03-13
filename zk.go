@@ -32,11 +32,13 @@ func NewZK(servers []string, chrootPath string, recvTimeout time.Duration) (*ZK,
 		return nil, err
 	}
 
-	if !strings.HasPrefix(chrootPath, "/") {
+	chrootPath = path.Clean(chrootPath)
+
+	if !path.IsAbs(chrootPath) {
 		chrootPath = "/" + chrootPath
 	}
 
-	return &ZK{Conn: conn, chrootPath: strings.TrimSuffix(chrootPath, "/")}, nil
+	return &ZK{Conn: conn, chrootPath: chrootPath}, nil
 }
 
 /*******************************************************************

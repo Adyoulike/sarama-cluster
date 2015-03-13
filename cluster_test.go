@@ -4,8 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
-	"runtime"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -33,107 +32,129 @@ var _ = Describe("PartitionSlice", func() {
 
 })
 
-/*********************************************************************
- * TEST HOOK
- *********************************************************************/
+// --------------------------------------------------------------------
 
 const (
-	t_KAFKA_VERSION = "kafka_2.10-0.8.1.1"
-	t_CLIENT        = "sarama-cluster-client"
-	t_TOPIC         = "sarama-cluster-topic"
-	t_GROUP         = "sarama-cluster-group"
-	t_DIR           = "/tmp/sarama-cluster-test"
+	tTopic  = "sarama-cluster-topic"
+	tTopicX = "sarama-cluster-topic-x"
+	tGroup  = "sarama-cluster-group"
+	tGroupX = "sarama-cluster-group-x"
+	tDir    = "/tmp/sarama-cluster-test"
 )
 
 var (
-	t_ZK_ADDRS = []string{"localhost:22181"}
+	tKafkaDir   = "kafka_2.11-0.8.2.0"
+	tKafkaAddrs = []string{"127.0.0.1:29092"}
+	tZKAddrs    = []string{"127.0.0.1:22181"}
+	tN          = 100000
 )
 
+func init() {
+	if dir := os.Getenv("KAFKA_DIR"); dir != "" {
+		tKafkaDir = dir
+	}
+	if testing.Short() {
+		tN = 10000
+	}
+}
+
+// --------------------------------------------------------------------
+
 var _ = BeforeSuite(func() {
-	runner := testDir(t_KAFKA_VERSION, "bin", "kafka-run-class.sh")
-	testState.zookeeper = exec.Command(runner, "-name", "zookeeper", "org.apache.zookeeper.server.ZooKeeperServerMain", testDir("zookeeper.properties"))
-	testState.kafka = exec.Command(runner, "-name", "kafkaServer", "kafka.Kafka", testDir("server.properties"))
-	testState.kafka.Env = []string{"KAFKA_HEAP_OPTS=-Xmx1G -Xms1G"}
+	run := testDir(tKafkaDir, "bin", "kafka-run-class.sh")
+	cli := testDir(tKafkaDir, "bin", "kafka-topics.sh")
+	scenario.zk = exec.Command(run, "-name", "zookeeper", "org.apache.zookeeper.server.ZooKeeperServerMain", testDir("zookeeper.properties"))
+	// scenario.zk.Stderr = os.Stderr
+	// scenario.zk.Stdout = os.Stdout
+
+	scenario.kafka = exec.Command(run, "-name", "kafkaServer", "kafka.Kafka", testDir("server.properties"))
+	scenario.kafka.Env = []string{"KAFKA_HEAP_OPTS=-Xmx1G -Xms1G"}
+	// scenario.kafka.Stderr = os.Stderr
+	// scenario.kafka.Stdout = os.Stdout
 
 	// Create Dir
-	Expect(os.MkdirAll(t_DIR, 0775)).NotTo(HaveOccurred())
+	Expect(os.MkdirAll(tDir, 0775)).NotTo(HaveOccurred())
 
 	// Start ZK & Kafka
-	Expect(testState.zookeeper.Start()).NotTo(HaveOccurred())
-	Expect(testState.kafka.Start()).NotTo(HaveOccurred())
+	Expect(scenario.zk.Start()).NotTo(HaveOccurred())
+	Expect(scenario.kafka.Start()).NotTo(HaveOccurred())
 
 	// Wait for client
 	var client *sarama.Client
 	Eventually(func() error {
 		var err error
-		client, err = newClient()
+		client, err = sarama.NewClient(tKafkaAddrs, nil)
 		return err
 	}, "10s", "1s").ShouldNot(HaveOccurred())
 	defer client.Close()
 
+	// Ensure we can retrieve partition info
 	Eventually(func() error {
-		_, err := client.Partitions(t_TOPIC)
+		_, err := client.Partitions(tTopic)
 		return err
 	}, "10s", "1s").ShouldNot(HaveOccurred())
 
-	// Seed messages
-	Expect(seedMessages(client, 10000)).NotTo(HaveOccurred())
+	// Create a special truncated topic with a small retention config
+	cmd := exec.Command(cli, "--zookeeper", "localhost:22181", "--create", "--topic", tTopicX, "--partitions", "1", "--replication-factor", "1", "--config", "segment.bytes=1024", "--config", "retention.bytes=4096")
+	Expect(cmd.Run()).NotTo(HaveOccurred())
+
+	// Seed messages to primary topic
+	p1, err := sarama.NewProducerFromClient(client)
+	Expect(err).NotTo(HaveOccurred())
+	for i := 0; i < tN; i++ {
+		kv := sarama.StringEncoder(fmt.Sprintf("PLAINDATA-%08d", i))
+		p1.Input() <- &sarama.ProducerMessage{Topic: tTopic, Key: kv, Value: kv}
+	}
+	Expect(p1.Close()).NotTo(HaveOccurred())
+
+	// Seed messages to truncated topic
+	p2, err := sarama.NewSyncProducerFromClient(client)
+	Expect(err).NotTo(HaveOccurred())
+	for i := 0; i < 100; i++ {
+		kv := sarama.StringEncoder(fmt.Sprintf("PLAINDATA-%08d", i))
+		_, _, err := p2.SendMessage(tTopicX, kv, kv)
+		Expect(err).NotTo(HaveOccurred())
+	}
+	Expect(p2.Close()).NotTo(HaveOccurred())
 })
 
 var _ = AfterSuite(func() {
-	if testState.kafka != nil {
-		testState.kafka.Process.Kill()
+	if scenario.kafka != nil {
+		scenario.kafka.Process.Kill()
 	}
-	if testState.zookeeper != nil {
-		testState.zookeeper.Process.Kill()
+	if scenario.zk != nil {
+		scenario.zk.Process.Kill()
 	}
-	Expect(os.RemoveAll(t_DIR)).NotTo(HaveOccurred())
+	Expect(os.RemoveAll(tDir)).NotTo(HaveOccurred())
 })
 
 func TestSuite(t *testing.T) {
 	RegisterFailHandler(Fail)
 	AfterEach(func() {
 		zk, err := NewZK(t_ZK_ADDRS, "", time.Second)
+
 		Expect(err).NotTo(HaveOccurred())
 
-		zk.DeleteAll("/consumers/" + t_GROUP)
+		zk.DeleteAll("/consumers/" + tGroup)
 		zk.Close()
 	})
 	RunSpecs(t, "sarama/cluster")
 }
 
-/*******************************************************************
- * TEST HELPERS
- *******************************************************************/
+// --------------------------------------------------------------------
 
-var testState struct{ kafka, zookeeper *exec.Cmd }
+var scenario struct{ kafka, zk *exec.Cmd }
 
-func newClient() (*sarama.Client, error) {
-	return sarama.NewClient(t_CLIENT, []string{"127.0.0.1:29092"}, nil)
+func newConsumer(conf *Config) (*Consumer, error) {
+	return NewConsumer(tKafkaAddrs, tZKAddrs, tGroup, tTopic, conf)
 }
 
 func testDir(tokens ...string) string {
-	_, filename, _, _ := runtime.Caller(1)
-	tokens = append([]string{path.Dir(filename), "_test"}, tokens...)
-	return path.Join(tokens...)
+	tokens = append([]string{"_test"}, tokens...)
+	return filepath.Join(tokens...)
 }
 
-func seedMessages(client *sarama.Client, count int) error {
-	producer, err := sarama.NewSimpleProducer(client, t_TOPIC, nil)
-	if err != nil {
-		return err
-	}
-	defer producer.Close()
-
-	for i := 0; i < count; i++ {
-		kv := sarama.StringEncoder(fmt.Sprintf("PLAINDATA-%08d", i))
-		err := producer.SendMessage(kv, kv)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
+// --------------------------------------------------------------------
 
 type mockNotifier struct {
 	lock     sync.Mutex
